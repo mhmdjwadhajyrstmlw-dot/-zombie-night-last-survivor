@@ -1,0 +1,695 @@
+import math
+import random
+import sys
+import pygame
+
+pygame.init()
+
+# ================= SHADOW FPS: ZOMBIE APOCALYPSE =================
+
+W, H = 960, 540
+FPS = 40
+FOV = math.radians(66)
+HALF_FOV = FOV / 2
+MAX_DEPTH = 18
+RAY_STEP = 3
+
+screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+pygame.display.set_caption("SHADOW FPS: ZOMBIE APOCALYPSE")
+SW, SH = screen.get_size()
+canvas = pygame.Surface((W, H))
+clock = pygame.time.Clock()
+
+font_small = pygame.font.SysFont("arial", 17, bold=True)
+font_medium = pygame.font.SysFont("arial", 23, bold=True)
+font_big = pygame.font.SysFont("arial", 38, bold=True)
+
+WORLD = [
+    "################",
+    "#..............#",
+    "#..##..........#",
+    "#..............#",
+    "#......##......#",
+    "#..............#",
+    "#....#.........#",
+    "#....#.....##..#",
+    "#..............#",
+    "#..##..........#",
+    "#..............#",
+    "#......##......#",
+    "#..............#",
+    "#..............#",
+    "#..............#",
+    "################",
+]
+MAP_H = len(WORLD)
+MAP_W = len(WORLD[0])
+
+player_x, player_y = 2.5, 2.5
+angle = 0.0
+pitch = 0.0
+health = 100
+score = 0
+wave = 1
+ammo = 24
+reserve_ammo = 144
+reloading = False
+reload_timer = 0.0
+fire_cooldown = 0.0
+muzzle_flash = 0.0
+hurt_flash = 0.0
+jump_height = 0.0
+jump_velocity = 0.0
+aiming = False
+sprinting = False
+game_over = False
+
+zombies = []
+zbuffer = [MAX_DEPTH] * W
+
+MOVE = (82, H - 83, 94)
+FIRE = (W - 116, H - 116, 100, 100)
+AIM = (W - 230, H - 110, 70, 70)
+RUN = (W - 335, H - 85, 65, 65)
+JUMP = (W - 430, H - 85, 65, 65)
+RELOAD = (W - 205, H - 188, 55, 55)
+
+move_x = 0.0
+move_y = 0.0
+fire_held = False
+look_finger = None
+move_finger = None
+look_last = None
+touch_modes = {}
+mouse_look = False
+mouse_last = None
+
+
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def wrap_angle(a):
+    return (a + math.pi) % (math.tau) - math.pi
+
+
+def is_wall(x, y):
+    ix, iy = int(x), int(y)
+    if ix < 0 or iy < 0 or ix >= MAP_W or iy >= MAP_H:
+        return True
+    return WORLD[iy][ix] == "#"
+
+
+def move_collision(x, y, dx, dy, radius=0.18):
+    nx = x + dx
+    if not is_wall(nx + (radius if dx >= 0 else -radius), y):
+        x = nx
+    ny = y + dy
+    if not is_wall(x, ny + (radius if dy >= 0 else -radius)):
+        y = ny
+    return x, y
+
+
+def free_spot(min_dist=3.5):
+    spots = []
+    for yy in range(1, MAP_H - 1):
+        for xx in range(1, MAP_W - 1):
+            if WORLD[yy][xx] == ".":
+                sx, sy = xx + 0.5, yy + 0.5
+                if math.hypot(sx - player_x, sy - player_y) >= min_dist:
+                    spots.append((sx, sy))
+    return random.choice(spots) if spots else (MAP_W - 2.5, MAP_H - 2.5)
+
+
+def spawn_wave():
+    zombies.clear()
+    for _ in range(min(5 + wave * 2, 18)):
+        x, y = free_spot()
+        zombies.append({
+            "x": x, "y": y,
+            "hp": 100 + max(0, wave - 3) * 15,
+            "speed": random.uniform(0.42, 0.63) + min(wave * 0.018, 0.2),
+            "attack": 0.0,
+            "walk": random.random() * 10,
+            "hurt": 0.0,
+            "size": random.uniform(0.9, 1.12),
+            "tone": random.choice([0, 1, 2])
+        })
+
+
+def cast_ray(ray_angle):
+    dx = math.cos(ray_angle)
+    dy = math.sin(ray_angle)
+    dist = 0.0
+    while dist < MAX_DEPTH:
+        dist += 0.035
+        tx = player_x + dx * dist
+        ty = player_y + dy * dist
+        if is_wall(tx, ty):
+            side = 0 if abs((tx % 1) - 0.5) > abs((ty % 1) - 0.5) else 1
+            return dist, side, tx, ty
+    return MAX_DEPTH, 0, player_x + dx * MAX_DEPTH, player_y + dy * MAX_DEPTH
+
+
+def line_of_sight(x1, y1, x2, y2):
+    dist = math.hypot(x2 - x1, y2 - y1)
+    steps = max(2, int(dist / 0.12))
+    for i in range(1, steps):
+        t = i / steps
+        if is_wall(x1 + (x2 - x1) * t, y1 + (y2 - y1) * t):
+            return False
+    return True
+
+
+def draw_world():
+    horizon = int(H / 2 + pitch * H * 0.8 + jump_height * 0.7)
+    horizon = clamp(horizon, 90, H - 70)
+
+    for y in range(H // 2):
+        t = y / (H // 2)
+        pygame.draw.line(
+            canvas,
+            (int(7 + 10 * t), int(13 + 12 * t), int(22 + 12 * t)),
+            (0, y), (W, y)
+        )
+
+    for y in range(H // 2, H):
+        t = (y - H // 2) / (H // 2)
+        pygame.draw.line(
+            canvas,
+            (int(27 - 12 * t), int(34 - 12 * t), int(31 - 10 * t)),
+            (0, y), (W, y)
+        )
+
+    for col in range(0, W, RAY_STEP):
+        ray = angle - HALF_FOV + col / W * FOV
+        dist, side, tx, ty = cast_ray(ray)
+        corrected = max(0.08, dist * math.cos(ray - angle))
+        wall_h = min(H * 2, int(H * 0.92 / corrected))
+        top = horizon - wall_h // 2
+
+        tex = tx % 1 if side == 0 else ty % 1
+        pattern = 0.82 + 0.18 * math.sin(tex * math.pi * 8)
+        fog = clamp(1 - corrected / 22, 0.16, 1.0)
+        base = (110, 82, 69) if side == 0 else (76, 87, 87)
+        factor = (0.82 if side == 0 else 0.64) * pattern * fog
+        color = tuple(int(c * factor) for c in base)
+
+        pygame.draw.rect(canvas, color, (col, top, RAY_STEP + 1, wall_h))
+        if int(tex * 8) == 0 and corrected < 8:
+            pygame.draw.line(canvas, (35, 39, 39),
+                             (col, top), (col, top + wall_h), 1)
+
+        for xx in range(col, min(W, col + RAY_STEP)):
+            zbuffer[xx] = corrected
+
+    for i in range(1, 9):
+        yy = horizon + int((H - horizon) * (i / 9) ** 1.8)
+        if horizon < yy < H:
+            pygame.draw.line(canvas, (31, 35, 33), (0, yy), (W, yy))
+
+
+def project(wx, wy, scale=1.0):
+    dx, dy = wx - player_x, wy - player_y
+    dist = math.hypot(dx, dy)
+    if dist < 0.1:
+        return None
+
+    rel = wrap_angle(math.atan2(dy, dx) - angle)
+    if abs(rel) > HALF_FOV + 0.25:
+        return None
+
+    corrected = dist * math.cos(rel)
+    if corrected <= 0:
+        return None
+
+    sx = int((0.5 + rel / FOV) * W)
+    size = int(H * 0.72 / corrected * scale)
+    sy = H // 2 + int(pitch * H * 0.8) + int(jump_height * 0.7)
+    return sx, sy, size, corrected
+
+
+def draw_zombie(z):
+    p = project(z["x"], z["y"], z["size"])
+    if not p:
+        return
+
+    sx, sy, size, dist = p
+    if size < 5:
+        return
+
+    ix = int(clamp(sx, 0, W - 1))
+    if dist > zbuffer[ix] + 0.12:
+        return
+
+    scale = clamp(1.0 - dist / 15, 0.22, 1.0)
+    skins = [(78, 126, 76), (118, 112, 81), (88, 103, 94)]
+    skin = tuple(int(c * scale) for c in skins[z["tone"]])
+    dark = tuple(int(c * scale) for c in (34, 39, 37))
+    robe = tuple(int(c * scale) for c in (50, 63, 58))
+    if z["hurt"] > 0:
+        skin = tuple(int(c * scale) for c in (180, 45, 40))
+
+    width = max(4, int(size * 0.60))
+    height = max(6, int(size * 0.94))
+    left = int(sx - width / 2)
+    top = int(sy - height * 0.52)
+    swing = math.sin(z["walk"] * 5) * size * 0.05
+
+    leg_w = max(2, width // 4)
+    leg_h = max(3, int(height * 0.27))
+    pygame.draw.rect(canvas, dark,
+                     (int(sx - width * 0.24), int(top + height * 0.72), leg_w, leg_h))
+    pygame.draw.rect(canvas, dark,
+                     (int(sx + width * 0.05), int(top + height * 0.72), leg_w, leg_h))
+
+    pygame.draw.ellipse(canvas, robe,
+                        (int(sx - width * 0.34), int(top + height * 0.32),
+                         int(width * 0.68), int(height * 0.48)))
+
+    pygame.draw.line(canvas, skin,
+                     (int(sx - width * 0.25), int(top + height * 0.39)),
+                     (int(sx - width * 0.48 + swing), int(top + height * 0.65)),
+                     max(2, width // 6))
+    pygame.draw.line(canvas, skin,
+                     (int(sx + width * 0.25), int(top + height * 0.39)),
+                     (int(sx + width * 0.48 - swing), int(top + height * 0.62)),
+                     max(2, width // 6))
+
+    head_w = max(4, int(width * 0.57))
+    head_h = max(4, int(height * 0.23))
+    hx, hy = int(sx - head_w / 2), int(top + height * 0.07)
+    pygame.draw.ellipse(canvas, skin, (hx, hy, head_w, head_h))
+    pygame.draw.rect(canvas, dark,
+                     (int(sx - head_w * 0.34), int(hy + head_h * 0.55),
+                      max(2, int(head_w * 0.68)), max(2, head_h // 4)))
+
+    eye = (235, 45, 30)
+    pygame.draw.circle(canvas, eye,
+                       (int(sx - head_w * 0.18), int(hy + head_h * 0.43)),
+                       max(1, int(head_w * 0.055)))
+    pygame.draw.circle(canvas, eye,
+                       (int(sx + head_w * 0.18), int(hy + head_h * 0.43)),
+                       max(1, int(head_w * 0.055)))
+
+    if z["hp"] < 100:
+        bw = max(12, int(width * 1.1))
+        pygame.draw.rect(canvas, (30, 20, 20), (sx - bw // 2, top - 5, bw, 3))
+        pygame.draw.rect(canvas, (65, 225, 80),
+                         (sx - bw // 2, top - 5, int(bw * max(0, z["hp"]) / 100), 3))
+
+
+def draw_weapon():
+    aim_scale = 0.70 if aiming else 1.0
+    recoil = muzzle_flash * 20
+    x = int(W * 0.70)
+    y = int(H * 0.79 + recoil)
+    w = int(W * 0.25 * aim_scale)
+    h = int(H * 0.19 * aim_scale)
+
+    pygame.draw.polygon(canvas, (91, 67, 54), [
+        (x + w * 0.32, y + h * 0.54),
+        (x + w * 0.72, y + h * 0.35),
+        (x + w * 0.95, y + h * 0.86),
+        (x + w * 0.48, y + h)
+    ])
+    pygame.draw.polygon(canvas, (174, 119, 87), [
+        (x + w * 0.45, y + h * 0.52),
+        (x + w * 0.70, y + h * 0.42),
+        (x + w * 0.82, y + h * 0.73),
+        (x + w * 0.55, y + h * 0.82)
+    ])
+    pygame.draw.polygon(canvas, (25, 30, 31), [
+        (x + w * 0.05, y + h * 0.40),
+        (x + w * 0.63, y + h * 0.30),
+        (x + w * 0.80, y + h * 0.45),
+        (x + w * 0.29, y + h * 0.60)
+    ])
+    pygame.draw.polygon(canvas, (54, 62, 62), [
+        (x + w * 0.18, y + h * 0.30),
+        (x + w * 0.95, y + h * 0.22),
+        (x + w, y + h * 0.32),
+        (x + w * 0.20, y + h * 0.42)
+    ])
+    pygame.draw.rect(canvas, (14, 17, 18),
+                     (int(x + w * 0.68), int(y + h * 0.24),
+                      int(w * 0.30), max(3, int(h * 0.08))))
+    pygame.draw.polygon(canvas, (18, 21, 22), [
+        (x + w * 0.32, y + h * 0.52),
+        (x + w * 0.46, y + h * 0.50),
+        (x + w * 0.50, y + h * 0.86),
+        (x + w * 0.39, y + h * 0.87)
+    ])
+
+    if muzzle_flash > 0:
+        tip = (int(x + w * 1.02), int(y + h * 0.28))
+        pygame.draw.polygon(canvas, (255, 230, 120), [
+            tip, (tip[0] + 22, tip[1] - 12),
+            (tip[0] + 12, tip[1] + 2),
+            (tip[0] + 25, tip[1] + 13)
+        ])
+
+
+def text(msg, x, y, f=font_medium, color=(240, 245, 245), centered=False):
+    img = f.render(str(msg), True, color)
+    if centered:
+        x -= img.get_width() // 2
+    canvas.blit(img, (int(x), int(y)))
+
+
+def draw_button(rect, label, active=False, small=False):
+    x, y, w, h = rect
+    surf = pygame.Surface((w, h), pygame.SRCALPHA)
+    fill = (29, 62, 60, 185) if active else (13, 25, 29, 155)
+    pygame.draw.ellipse(surf, fill, (0, 0, w, h))
+    pygame.draw.ellipse(surf, (113, 194, 162, 240), (1, 1, w - 2, h - 2), 3)
+    canvas.blit(surf, (x, y))
+    f = font_small if small else font_medium
+    img = f.render(label, True, (235, 245, 245))
+    canvas.blit(img, (x + (w - img.get_width()) // 2,
+                      y + (h - img.get_height()) // 2))
+
+
+def draw_ui():
+    pygame.draw.rect(canvas, (220, 230, 230), (26, 25, 210, 24), 2)
+    pygame.draw.rect(canvas, (24, 37, 36), (29, 28, 204, 18))
+    pygame.draw.rect(canvas, (38, 220, 91) if health > 30 else (230, 60, 48),
+                     (29, 28, int(204 * max(0, health) / 100), 18))
+    text("HP " + str(int(health)), 28, 52, font_small)
+    text("WAVE " + str(wave), int(W * 0.35), 20, font_big, (55, 245, 112))
+    text("SCORE " + str(score), int(W * 0.56), 25, font_medium, (55, 245, 112))
+    text("AMMO " + str(ammo) + " / " + str(reserve_ammo),
+         W - 18, 25, font_medium, centered=False)
+    # Center reticle
+    cx, cy = W // 2, H // 2 + int(pitch * H * 0.8)
+    gap = 5 if aiming else 9
+    pygame.draw.line(canvas, (230, 245, 238), (cx - gap - 7, cy), (cx - gap, cy), 2)
+    pygame.draw.line(canvas, (230, 245, 238), (cx + gap, cy), (cx + gap + 7, cy), 2)
+    pygame.draw.line(canvas, (230, 245, 238), (cx, cy - gap - 7), (cx, cy - gap), 2)
+    pygame.draw.line(canvas, (230, 245, 238), (cx, cy + gap), (cx, cy + gap + 7), 2)
+
+    mx, my, mr = MOVE
+    draw_button((mx - mr // 2, my - mr // 2, mr, mr), "MOVE")
+    draw_button(FIRE, "FIRE", fire_held)
+    draw_button(AIM, "AIM", aiming, True)
+    draw_button(RUN, "RUN", sprinting, True)
+    draw_button(JUMP, "JUMP", jump_height > 0.1, True)
+    draw_button(RELOAD, "R", reloading, True)
+
+    if reloading:
+        text("RELOADING...", W // 2, 70, font_medium, (255, 220, 100), True)
+
+    if hurt_flash > 0:
+        pygame.draw.rect(canvas, (180, 35, 30), (0, 0, W, H),
+                         max(2, int(hurt_flash * 8)))
+
+    if game_over:
+        shade = pygame.Surface((W, H), pygame.SRCALPHA)
+        shade.fill((0, 0, 0, 190))
+        canvas.blit(shade, (0, 0))
+        text("YOU DIED", W // 2, H // 2 - 60, font_big, (255, 70, 60), True)
+        text("Tap anywhere to restart", W // 2, H // 2 + 4,
+             font_medium, centered=True)
+        text("SCORE " + str(score), W // 2, H // 2 + 40,
+             font_medium, (70, 245, 120), True)
+
+
+def hit_button(p, rect):
+    x, y, w, h = rect
+    return x <= p[0] <= x + w and y <= p[1] <= y + h
+
+
+def screen_to_base(pos):
+    return pos[0] * W / SW, pos[1] * H / SH
+
+
+def reload_gun():
+    global reloading, reload_timer
+    if not reloading and ammo < 24 and reserve_ammo > 0:
+        reloading = True
+        reload_timer = 1.35
+
+
+def shoot():
+    global ammo, fire_cooldown, muzzle_flash, score
+    if game_over or reloading or fire_cooldown > 0 or ammo <= 0:
+        return
+
+    ammo -= 1
+    fire_cooldown = 0.24 if aiming else 0.20
+    muzzle_flash = 0.08
+
+    best = None
+    best_dist = 999
+    max_angle = math.radians(5.2 if aiming else 3.8)
+
+    for z in zombies[:]:
+        dx, dy = z["x"] - player_x, z["y"] - player_y
+        dist = math.hypot(dx, dy)
+        rel = abs(wrap_angle(math.atan2(dy, dx) - angle))
+        if rel < max_angle and dist < best_dist:
+            if line_of_sight(player_x, player_y, z["x"], z["y"]):
+                best, best_dist = z, dist
+
+    if best:
+        best["hp"] -= 70 if best_dist < 5 else 55
+        best["hurt"] = 0.12
+        if best["hp"] <= 0:
+            score += 100
+            zombies.remove(best)
+
+
+def reset_game():
+    global player_x, player_y, angle, pitch, health, score, wave, ammo
+    global reserve_ammo, reloading, reload_timer, fire_cooldown
+    global muzzle_flash, hurt_flash, jump_height, jump_velocity, game_over
+
+    player_x, player_y, angle, pitch = 2.5, 2.5, 0.0, 0.0
+    health, score, wave = 100, 0, 1
+    ammo, reserve_ammo = 24, 144
+    reloading, reload_timer = False, 0.0
+    fire_cooldown, muzzle_flash, hurt_flash = 0.0, 0.0, 0.0
+    jump_height, jump_velocity, game_over = 0.0, 0.0, False
+    spawn_wave()
+
+
+spawn_wave()
+
+try:
+    while True:
+        dt = min(clock.tick(FPS) / 1000.0, 0.04)
+        fire_cooldown = max(0, fire_cooldown - dt)
+        muzzle_flash = max(0, muzzle_flash - dt)
+        hurt_flash = max(0, hurt_flash - dt)
+
+        if reloading:
+            reload_timer -= dt
+            if reload_timer <= 0:
+                amount = min(24 - ammo, reserve_ammo)
+                ammo += amount
+                reserve_ammo -= amount
+                reloading = False
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                raise SystemExit
+
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    raise SystemExit
+                elif event.key == pygame.K_r:
+                    reload_gun()
+                elif event.key == pygame.K_SPACE and jump_height <= 0.01:
+                    jump_velocity = 3.3
+                elif event.key == pygame.K_LSHIFT:
+                    sprinting = True
+                elif event.key == pygame.K_LCTRL:
+                    aiming = True
+                elif event.key == pygame.K_RETURN and game_over:
+                    reset_game()
+
+            elif event.type == pygame.KEYUP:
+                if event.key == pygame.K_LSHIFT:
+                    sprinting = False
+                elif event.key == pygame.K_LCTRL:
+                    aiming = False
+
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                p = screen_to_base(event.pos)
+                if game_over:
+                    reset_game()
+                    continue
+                if hit_button(p, FIRE):
+                    fire_held = True
+                    shoot()
+                elif hit_button(p, AIM):
+                    aiming = True
+                elif hit_button(p, RUN):
+                    sprinting = not sprinting
+                elif hit_button(p, JUMP):
+                    if jump_height <= 0.01:
+                        jump_velocity = 3.3
+                elif hit_button(p, RELOAD):
+                    reload_gun()
+                elif math.hypot(p[0] - MOVE[0], p[1] - MOVE[1]) < MOVE[2] * 0.6:
+                    move_finger = "mouse"
+                    move_x, move_y = 0.0, 0.0
+                else:
+                    mouse_look = True
+                    mouse_last = p
+
+            elif event.type == pygame.MOUSEBUTTONUP:
+                fire_held = False
+                aiming = False
+                mouse_look = False
+                mouse_last = None
+                if move_finger == "mouse":
+                    move_finger = None
+                    move_x, move_y = 0.0, 0.0
+
+            elif event.type == pygame.MOUSEMOTION:
+                p = screen_to_base(event.pos)
+                if mouse_look and mouse_last:
+                    angle += (p[0] - mouse_last[0]) * 0.0045
+                    pitch = clamp(pitch + (p[1] - mouse_last[1]) * 0.003, -0.55, 0.55)
+                    mouse_last = p
+                if move_finger == "mouse" and pygame.mouse.get_pressed()[0]:
+                    dx, dy = p[0] - MOVE[0], p[1] - MOVE[1]
+                    mag = max(1, math.hypot(dx, dy))
+                    move_x = clamp(dx / mag, -1, 1) * min(1, mag / 45)
+                    move_y = clamp(dy / mag, -1, 1) * min(1, mag / 45)
+
+            elif event.type == pygame.FINGERDOWN:
+                p = (event.x * W, event.y * H)
+                if game_over:
+                    reset_game()
+                    continue
+                mode = "look"
+                if hit_button(p, FIRE):
+                    mode = "fire"
+                    fire_held = True
+                    shoot()
+                elif hit_button(p, AIM):
+                    mode = "aim"
+                    aiming = True
+                elif hit_button(p, RUN):
+                    mode = "run"
+                    sprinting = not sprinting
+                elif hit_button(p, JUMP):
+                    mode = "jump"
+                    if jump_height <= 0.01:
+                        jump_velocity = 3.3
+                elif hit_button(p, RELOAD):
+                    mode = "reload"
+                    reload_gun()
+                elif math.hypot(p[0] - MOVE[0], p[1] - MOVE[1]) < MOVE[2] * 0.78:
+                    mode = "move"
+                    move_finger = event.finger_id
+                touch_modes[event.finger_id] = [mode, p]
+
+            elif event.type == pygame.FINGERMOTION:
+                p = (event.x * W, event.y * H)
+                item = touch_modes.get(event.finger_id)
+                if item:
+                    mode, last = item
+                    if mode == "look":
+                        angle += (p[0] - last[0]) * 0.006
+                        pitch = clamp(pitch + (p[1] - last[1]) * 0.003, -0.55, 0.55)
+                    elif mode == "move":
+                        dx, dy = p[0] - MOVE[0], p[1] - MOVE[1]
+                        mag = max(1, math.hypot(dx, dy))
+                        move_x = clamp(dx / 42, -1, 1) * min(1, mag / 42)
+                        move_y = clamp(dy / 42, -1, 1) * min(1, mag / 42)
+                    touch_modes[event.finger_id] = [mode, p]
+
+            elif event.type == pygame.FINGERUP:
+                item = touch_modes.pop(event.finger_id, None)
+                if item:
+                    mode = item[0]
+                    if mode == "fire":
+                        fire_held = False
+                    elif mode == "aim":
+                        aiming = False
+                    elif mode == "move":
+                        move_finger = None
+                        move_x, move_y = 0.0, 0.0
+
+        if not game_over:
+            keys = pygame.key.get_pressed()
+            forward = int(keys[pygame.K_w] or keys[pygame.K_UP]) - int(
+                keys[pygame.K_s] or keys[pygame.K_DOWN])
+            strafe = int(keys[pygame.K_d] or keys[pygame.K_RIGHT]) - int(
+                keys[pygame.K_a] or keys[pygame.K_LEFT])
+
+            forward -= move_y
+            strafe += move_x
+            mag = math.hypot(forward, strafe)
+            if mag > 1:
+                forward, strafe = forward / mag, strafe / mag
+
+            speed = 2.45 * (1.65 if sprinting or keys[pygame.K_LSHIFT] else 1)
+            if aiming:
+                speed *= 0.72
+
+            dx = (math.cos(angle) * forward - math.sin(angle) * strafe) * speed * dt
+            dy = (math.sin(angle) * forward + math.cos(angle) * strafe) * speed * dt
+            player_x, player_y = move_collision(player_x, player_y, dx, dy)
+
+            if jump_velocity or jump_height > 0:
+                jump_height += jump_velocity * dt
+                jump_velocity -= 8.5 * dt
+                if jump_height <= 0:
+                    jump_height, jump_velocity = 0.0, 0.0
+
+            if fire_held and fire_cooldown <= 0:
+                shoot()
+
+            for z in zombies[:]:
+                z["walk"] += dt
+                z["hurt"] = max(0, z["hurt"] - dt)
+                dist = math.hypot(player_x - z["x"], player_y - z["y"])
+
+                if dist > 0.78 and line_of_sight(z["x"], z["y"], player_x, player_y):
+                    vx = (player_x - z["x"]) / max(0.01, dist) * z["speed"] * dt
+                    vy = (player_y - z["y"]) / max(0.01, dist) * z["speed"] * dt
+                    z["x"], z["y"] = move_collision(z["x"], z["y"], vx, vy)
+                elif dist <= 0.90:
+                    z["attack"] -= dt
+                    if z["attack"] <= 0:
+                        health -= random.randint(5, 9)
+                        hurt_flash = 0.45
+                        z["attack"] = 0.9
+
+            if health <= 0:
+                health = 0
+                game_over = True
+
+            if not zombies:
+                wave += 1
+                reserve_ammo = min(300, reserve_ammo + 48)
+                health = min(100, health + 12)
+                spawn_wave()
+
+        draw_world()
+        for z in sorted(
+            zombies,
+            key=lambda item: math.hypot(item["x"] - player_x, item["y"] - player_y),
+            reverse=True
+        ):
+            draw_zombie(z)
+
+        draw_weapon()
+        draw_ui()
+
+        # Preserve the device's screen ratio by scaling to its full display.
+        pygame.transform.scale(canvas, (SW, SH), screen)
+        pygame.display.flip()
+
+except SystemExit:
+    pass
+except Exception as error:
+    print("SHADOW FPS error:", repr(error))
+    raise
+finally:
+    pygame.quit()
+    sys.exit()
